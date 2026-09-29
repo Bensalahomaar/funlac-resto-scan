@@ -7,17 +7,20 @@ import {
 import { preferTunisianField, roundMoney } from "./tunisianNumber";
 import { isJunkName, type ScanLine, type ScanResult } from "./mapInvoice";
 
-/** Modèles encore servis aux nouvelles clés AI Studio (2.5 est retiré). */
-const ALLOWLIST = [
+/** Du plus performant au plus léger. Tous sont essayés automatiquement. */
+const MODEL_LADDER = [
   "gemini-3.8-flash",
   "gemini-3.6-flash",
   "gemini-3.5-flash",
+  "gemini-3.1-flash",
   "gemini-flash-latest",
+  "gemini-2.0-flash",
   "gemini-3.1-flash-lite",
   "gemini-flash-lite-latest",
 ] as const;
-const HEAVY_MODEL = /^gemini-3\.[5-8]-flash$/;
-const CALL_DEADLINE_MS = 55_000;
+const CALL_DEADLINE_MS = 105_000;
+const MODEL_ATTEMPTS = 2;
+const LADDER_PASSES = 2;
 const MP_CATEGORIES = [
   "Biscuit et chocolaterie",
   "Charcuterie et fromage",
@@ -103,28 +106,40 @@ export async function analyzeInvoiceWithGemini(
   const started = Date.now();
   const failures: GeminiFailKind[] = [];
   let lastError = "Lecture Gemini impossible.";
-  let skipHeavy = false;
 
-  for (const model of ALLOWLIST) {
-    if (Date.now() - started > CALL_DEADLINE_MS) break;
-    if (skipHeavy && HEAVY_MODEL.test(model)) continue;
-    try {
-      const raw = await callGemini(key, model, parts, remaining(started));
-      return mapGeminiInvoice(raw, model);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : lastError;
-      const status = error instanceof GeminiAnalyzeError ? error.status : 0;
-      const kind = classifyGeminiFailure(status, lastError);
-      failures.push(kind);
-      if (kind === "invalid_key") {
-        throw new GeminiAnalyzeError(geminiUserMessage(kind), 503);
+  for (let pass = 0; pass < LADDER_PASSES; pass++) {
+    for (const model of MODEL_LADDER) {
+      if (Date.now() - started > CALL_DEADLINE_MS) break;
+      for (let attempt = 1; attempt <= MODEL_ATTEMPTS; attempt++) {
+        if (Date.now() - started > CALL_DEADLINE_MS) break;
+        try {
+          const raw = await callGemini(key, model, parts, remaining(started));
+          return mapGeminiInvoice(raw, model);
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : lastError;
+          const status = error instanceof GeminiAnalyzeError ? error.status : 0;
+          const kind = classifyGeminiFailure(status, lastError);
+          failures.push(kind);
+          if (kind === "invalid_key") {
+            throw new GeminiAnalyzeError(geminiUserMessage(kind), 503);
+          }
+          if (!shouldTryNextGeminiModel(kind)) {
+            throw error instanceof GeminiAnalyzeError ? error : new GeminiAnalyzeError(lastError, 503);
+          }
+          if (attempt < MODEL_ATTEMPTS && (kind === "overloaded" || kind === "rate_limit" || kind === "timeout")) {
+            await pause(kind === "timeout" ? 200 : 450 * attempt);
+            continue;
+          }
+          break;
+        }
       }
-      if (kind === "overloaded" && HEAVY_MODEL.test(model)) skipHeavy = true;
-      if (shouldTryNextGeminiModel(kind)) continue;
-      throw error instanceof GeminiAnalyzeError ? error : new GeminiAnalyzeError(lastError, 503);
     }
   }
   throw new GeminiAnalyzeError(geminiUserMessage(pickFailure(failures), lastError), statusFor(pickFailure(failures)));
+}
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildPrompt(suppliers: string[]): string {
@@ -252,9 +267,9 @@ async function callGeminiOnce(
   }
   const kind = classifyGeminiFailure(response.status, lastMessage);
   if (kind === "invalid_key") throw new GeminiAnalyzeError(geminiUserMessage(kind), 503);
-  if (kind === "overloaded") throw new GeminiAnalyzeError(geminiUserMessage(kind), 503);
-  if (kind === "quota") throw new GeminiAnalyzeError(geminiUserMessage(kind), 429);
-  if (kind === "rate_limit") throw new GeminiAnalyzeError(geminiUserMessage(kind), 429);
+  if (kind === "overloaded") throw new GeminiAnalyzeError("high demand", 503);
+  if (kind === "quota") throw new GeminiAnalyzeError("quota", 429);
+  if (kind === "rate_limit") throw new GeminiAnalyzeError("rate limit", 429);
   if (kind === "model_missing") throw new GeminiAnalyzeError("MODEL_MISSING", 404);
   throw new GeminiAnalyzeError(lastMessage, response.status >= 400 ? response.status : 503);
 }
@@ -277,18 +292,19 @@ function remaining(started: number): number {
 }
 
 function timeoutFor(model: string, budgetMs: number): number {
-  const preferred = /lite/i.test(model) ? 18_000 : 32_000;
-  return Math.max(8_000, Math.min(preferred, budgetMs - 1_000));
+  const preferred = /lite/i.test(model) ? 10_000 : 14_000;
+  return Math.max(6_000, Math.min(preferred, budgetMs - 800));
 }
 
 function pickFailure(failures: GeminiFailKind[]): GeminiFailKind {
-  if (failures.includes("quota") && failures.every((kind) => kind === "quota" || kind === "model_missing")) {
-    return "quota";
+  const unique = [...new Set(failures)];
+  if (unique.length === 1) return unique[0];
+  if (failures.every((kind) => kind === "quota" || kind === "model_missing")) return "quota";
+  if (failures.every((kind) => kind === "overloaded" || kind === "rate_limit" || kind === "model_missing")) {
+    return "overloaded";
   }
-  if (failures.includes("overloaded") || failures.includes("rate_limit")) return "overloaded";
-  if (failures.includes("quota")) return "quota";
   if (failures.includes("timeout")) return "timeout";
-  if (failures.includes("bad_request") || failures.includes("empty")) return "empty";
+  if (failures.includes("empty") || failures.includes("bad_request")) return "empty";
   return failures[failures.length - 1] || "other";
 }
 
@@ -393,7 +409,9 @@ function modelLabel(model: string): string {
   if (model.includes("3.8")) return "Gemini 3.8 Flash";
   if (model.includes("3.6")) return "Gemini 3.6 Flash";
   if (model.includes("3.5")) return "Gemini 3.5 Flash";
+  if (model.includes("3.1-flash-lite")) return "Gemini 3.1 Flash Lite";
   if (model.includes("3.1")) return "Gemini 3.1 Flash";
+  if (model.includes("2.0")) return "Gemini 2.0 Flash";
   if (model.includes("lite")) return "Gemini Flash Lite";
   if (model.includes("flash-latest")) return "Gemini Flash";
   return "Gemini";

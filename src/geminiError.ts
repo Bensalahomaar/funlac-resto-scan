@@ -37,11 +37,11 @@ export function classifyGeminiFailure(status: number, message: string): GeminiFa
 export function geminiUserMessage(kind: GeminiFailKind, fallback = "Lecture Gemini impossible."): string {
   switch (kind) {
     case "quota":
-      return "Quota Gemini atteint. Réessaie plus tard.";
+      return "Quota Gemini atteint sur tous les modèles.";
     case "rate_limit":
-      return "Gemini limite le nombre d’appels. Réessaie dans une minute.";
+      return "Gemini a limité tous les modèles. Relance Relire avec Gemini.";
     case "overloaded":
-      return "Gemini est saturé. Réessaie dans une minute — pas besoin d’une nouvelle clé.";
+      return "Lecture Gemini impossible après tous les modèles. Relance Relire avec Gemini.";
     case "invalid_key":
       return "Clé Gemini invalide. Colle une nouvelle clé dans Mon compte.";
     case "timeout":
@@ -58,13 +58,5 @@ export function geminiUserMessage(kind: GeminiFailKind, fallback = "Lecture Gemi
 }
 
 export function shouldTryNextGeminiModel(kind: GeminiFailKind): boolean {
-  return (
-    kind === "model_missing" ||
-    kind === "overloaded" ||
-    kind === "quota" ||
-    kind === "rate_limit" ||
-    kind === "timeout" ||
-    kind === "bad_request" ||
-    kind === "empty"
-  );
+  return kind !== "invalid_key";
 }
